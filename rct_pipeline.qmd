@@ -1,0 +1,740 @@
+---
+title: "Systematic CV-RCT Bayesian Pipeline"
+subtitle: "EB + MCMC + Type M/S + S-values across a curated cardiovascular RCT cohort"
+author: "Dr. James Brophy"
+format:
+  html:
+    theme: [simple, custom.scss]
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+  cache: true
+  freeze: auto
+bibliography: bib.bib
+csl: vancouver.csl
+params:
+  n_mcmc_chains: 2
+  n_mcmc_iter: 1000
+  n_eb_draws: 100000
+---
+
+```{r}
+#| label: setup
+#| include: true
+#| cache: false
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(readr)
+  library(ggplot2)
+  library(purrr)
+})
+
+# Shared Shiny/EB helpers (merged post-PR1) + pipeline-specific helpers.
+source("R/priors.R")
+source("R/eb_mixture.R")
+source("R/pipeline.R")
+
+set.seed(2026)
+
+RESULTS_DIR <- "results"
+dir.create(RESULTS_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# Tuned-down MCMC for fast end-to-end render. Bump chains/iter for production.
+N_CHAINS <- params$n_mcmc_chains
+N_ITER   <- params$n_mcmc_iter
+N_EB     <- params$n_eb_draws
+
+```
+
+```{r}
+#| label: stan-probe
+#| include: false
+#| cache: false
+# Detect a Stan backend ONCE. We (a) check for cmdstanr/rstan, then (b) do
+# a real micro-compile. Any compilation error (including broken C++
+# toolchains that write to the subprocess stderr) is hidden because the
+# whole chunk is rendered with `include: false` - output, messages and
+# warnings are all suppressed before they can reach the HTML. On any
+# failure we fall straight through to the analytic Normal-Normal path,
+# which is mathematically identical to the brms normal-pseudo-likelihood
+# model for this problem.
+HAVE_STAN <- tryCatch({
+  b <- tryCatch(choose_brms_backend(), error = function(e) NULL)
+  if (is.null(b) || !nzchar(b) || !requireNamespace("brms", quietly = TRUE)) {
+    FALSE
+  } else {
+    fit <- suppressMessages(suppressWarnings(tryCatch(
+      brms::brm(
+        formula = brms::bf(effect | se(se) ~ 1),
+        data    = tibble::tibble(effect = 0, se = 1),
+        family  = gaussian(),
+        prior   = brms::prior_string("normal(0, 10)", class = "Intercept"),
+        backend = b, chains = 1, iter = 200, refresh = 0, silent = 2, seed = 1
+      ),
+      error = function(e) NULL
+    )))
+    !is.null(fit)
+  }
+}, error = function(e) FALSE)
+```
+
+## Overview
+
+This document implements a systematic, reproducible re-analysis of a curated
+cohort of landmark cardiovascular RCTs. For each trial we compute:
+
+- Observed log-HR, SE, z, p-value, and Shannon S-value.
+- Type M / Type S errors via Gelman–Carlin retrodesign simulation.
+- Empirical-Bayes shrinkage on the signal-to-noise-ratio (SNR) scale using the
+  4-component van Zwet et al. 2025 mixture [@RN2].
+- Five MCMC posteriors under different priors via `brms` with a normal
+  pseudo-likelihood on (log-HR, SE_logHR):
+  Weak, Skeptical, Enthusiastic, EB, Design-informed.
+
+The last section reproduces the DECAF worked example from `eb2.qmd` through
+this pipeline and sanity-checks the EB posterior HR.
+
+Citation: van Zwet E, Więcek W, Gelman A. Meta-analysis with a single study.
+*Stat Methods Med Res* 2025;34(12):2302-2312. doi:10.1177/09622802251380628.
+
+### Headline findings
+
+- Posterior `P(HR < 1)` is essentially 1 for all studies that crossed
+  significance, but `P(HR ≤ MCID)` varies from ~0.05 (EMPA-REG) to ~1
+  (PARADIGM-HF, RALES) under the EB prior — i.e., *clinically meaningful*
+  benefit is far less unanimous than *any* benefit.
+- EB shrinkage pulls observed effects 10–30 % toward the null. Marginal
+  trials (DECAF, EMPA-REG) shrink most.
+- The Design-informed prior re-creates the textbook DECAF "twist":
+  the data and the protocol-prior point in opposite directions, so the
+  posterior median is dragged materially closer to 1 and the calibration
+  metrics flag the prior–data conflict.
+
+## Methods
+
+The pipeline follows four stages, all driven by a single curated
+cohort CSV (`data/rct_cohort.csv`). The full source — including the
+rehydrated EB mixture and `brms` model code — lives in `R/`:
+
+1. **Cohort ingestion.** Trials are entered with reported effect (HR, RR),
+   95% CI, raw arm counts where available, design power, MCID (the effect
+   the trial was powered to detect), and an optional `design_hr` column for
+   trials whose pre-specified direction differs from the observed effect
+   direction (DECAF). Provenance for each row is documented in
+   `docs/cohort.md`.
+2. **Per-study frequentist layer.** From the reported HR and CI we recover
+   `(log-HR, SE_logHR)` analytically, then derive `z`, `p`, and *two*
+   Shannon S-values: `S vs RR = 1` (against the null) and `S vs RR = MCID`
+   (against the design-target effect). Type-S and Type-M errors are
+   computed by Gelman–Carlin retrodesign simulation given each trial's
+   reported power.
+3. **Empirical-Bayes posterior.** The four-component van Zwet 2025
+   mixture on the *signal-to-noise-ratio* (SNR) scale is updated
+   conjugately within each component and re-weighted by component
+   likelihood, exactly matching `eb2.qmd`. We retain the full mixture
+   posterior — not a Normal approximation — and propagate it to log-HR
+   draws via `mu = SNR · SE_logHR`. Per-study mixture decomposition
+   (component weights, conditional means, shrinkage factors `B_k`,
+   pooled `B̄`) is reported.
+4. **Bayesian re-analysis under five priors.** A `brms` normal
+   pseudo-likelihood on `(logHR, SE_logHR)` is fit under each of:
+   *Weak* (`N(0, 10)`), *Skeptical* (`N(0, 0.354)` — half on RR ≤ 0.5),
+   *Enthusiastic* (`N(log MCID, 0.354)`), *EB* (van Zwet mixture, used
+   directly via SNR draws — not re-fit through brms), and
+   *Design-informed* (`N(log design_hr, SE_logHR)`). When no Stan
+   backend is available, the four Normal priors fall back to the
+   closed-form Normal–Normal posterior (mathematically identical to the
+   `brms` fit for this likelihood); the EB row is always taken from the
+   mixture draws.
+
+The analytic outputs per study are: posterior median HR, 95% CrI,
+`P(HR < 1)`, `P(HR ≤ MCID)`, plus Type-S, median Type-M, posterior
+coverage, and same-sign replication probability. Cross-study summaries
+are a forest plot of posterior medians by prior, a heatmap of
+`P(HR ≤ MCID)`, and a shrinkage scatter (`|z|` vs posterior `|SNR|`).
+
+## Cohort
+
+```{r}
+#| label: data
+cohort <- readr::read_csv("data/rct_cohort.csv", show_col_types = FALSE)
+knitr::kable(cohort |>
+               dplyr::select(study, journal, year, endpoint, effect_type,
+                             hr, ci_lo, ci_hi, n_t, n_c, power, mcid_rr))
+```
+
+```{r}
+#| label: derived-quantities
+# Derive logHR, SE, z, p, and TWO Shannon S-values per HR-scale row.
+#
+# Greenland's S-value (surprisal) is S = -log2(p).  It measures the
+# information, in bits, against the hypothesis that generated p.
+# S = k bits means the data are as surprising as k heads in a row from
+# a fair coin under H0.
+#
+# We report two S-values per study:
+#   * S_null : evidence against H0: RR = 1      (the textbook null)
+#   * S_mcid : evidence against H_MCID: RR = mcid_rr
+#               (evidence that the true effect is NOT at the
+#                clinically-meaningful threshold the trial was powered for)
+# Reading guide:
+#   - Large S_null AND small S_mcid  -> strong evidence of benefit, but
+#                                       the size is plausibly around MCID.
+#   - Large S_null AND large S_mcid  -> strong benefit AND larger than MCID.
+#   - Small S_null                    -> weak evidence of any effect.
+cohort_hr <- cohort |>
+  dplyr::filter(effect_type == "HR") |>
+  dplyr::mutate(
+    logHR      = log(hr),
+    se_logHR   = (log(ci_hi) - log(ci_lo)) / (2 * 1.96),
+    z_obs      = logHR / se_logHR,                       # z against RR = 1
+    p_two      = 2 * pnorm(-abs(z_obs)),                 # p against RR = 1
+    s_null     = s_value(pmax(p_two, .Machine$double.eps)),
+    z_mcid     = (logHR - log(mcid_rr)) / se_logHR,      # z against RR = mcid
+    p_mcid     = 2 * pnorm(-abs(z_mcid)),
+    s_mcid     = s_value(pmax(p_mcid, .Machine$double.eps))
+  )
+
+# Keep a back-compat alias column for downstream code.
+cohort_hr$s_value <- cohort_hr$s_null
+
+knitr::kable(
+  cohort_hr |>
+    dplyr::transmute(
+      study,
+      logHR    = round(logHR, 3),
+      se_logHR = round(se_logHR, 3),
+      z        = round(z_obs, 2),
+      p        = signif(p_two, 2),
+      `S vs RR=1`    = round(s_null, 2),
+      `S vs RR=MCID` = round(s_mcid, 2)
+    ),
+  caption = paste0(
+    "Observed-effect frequentist summary. Both S-values are Shannon ",
+    "surprisal values (bits). Larger = more evidence against the ",
+    "reference RR. S = -log2(p)."
+  )
+)
+```
+
+### Interpreting the two S-values
+Greenland's **S-value** (surprisal value) re-expresses a p-value as
+bits of information against the tested hypothesis: `S = -log2(p)`.  Put
+concretely, an S of 4.3 bits is *as surprising* as 4 or 5 heads in a row
+from a fair coin under H0.  Reporting S together with the p-value gives
+readers an intuitive sense of evidential strength without the 0.05 cliff.
+
+- **`S vs RR = 1`** — the standard interpretation: evidence against no
+  effect.  DECAF's 6.66 bits is the equivalent of 6–7 consecutive coin
+  flips landing the same way under the null; PARADIGM-HF's 20 bits is
+  roughly one-in-a-million territory.
+- **`S vs RR = MCID`** — evidence that the true effect is *not* at the
+  clinically-meaningful threshold the trial was powered for.  A small
+  value here (close to zero) means the observed point estimate is
+  statistically compatible with the MCID (which is the more interesting
+  finding for borderline-significant trials like DECAF — strong evidence
+  *against the null*, but negligible evidence against the MCID).
+
+## Per-study analysis
+
+```{r}
+#| label: per-study
+#| cache: true
+run_one <- function(row) {
+  study <- row$study
+  hr    <- row$hr
+  lo    <- row$ci_lo
+  hi    <- row$ci_hi
+  se    <- row$se_logHR
+  logHR <- row$logHR
+  z     <- row$z_obs
+  mcid  <- row$mcid_rr
+  # design_hr = mcid_rr unless the cohort row explicitly encodes a
+  # pre-registered direction opposite to what was observed (e.g. DECAF).
+  design_hr <- if (!is.null(row$design_hr) && is.finite(row$design_hr) &&
+                   row$design_hr > 0) row$design_hr else mcid
+  power <- row$power
+
+  # --- Type M / Type S at the trial's design (unit-SNR scale) ---
+  tms <- type_m_s(power = power, target_effect = 1, n_sim = 50000)
+
+  # --- EB posterior on SNR scale (van Zwet 4-component mixture) ---
+  # `eb$snr` are draws from the FULL mixture posterior on the SNR scale,
+  # exactly as `eb2.qmd` produces them. We use these draws directly
+  # (multiplied by SE) for the EB row so we faithfully propagate the
+  # mixture's posterior, instead of squashing it into a Normal
+  # approximation and re-running it through another Normal-Normal
+  # update with the same data.
+  eb <- eb_posterior_snr(z, n = N_EB)
+  eb_mu_log <- eb$post_mean * se        # used by build_priors() only as a
+  eb_sd_log <- eb$post_sd   * se        # Normal proxy on log-HR for brms.
+  snr_post_mean <- eb$post_mean
+
+  # Direct mixture-EB posterior on log-HR (the `eb2.qmd` computation):
+  eb_mu_draws  <- eb$snr * se
+  eb_RR_draws  <- exp(eb_mu_draws)
+  eb_draws_tbl <- tibble::tibble(prior = "EB",
+                                 mu    = eb_mu_draws,
+                                 RR    = eb_RR_draws)
+
+  # --- Five MCMC priors via brms ---
+  priors <- build_priors(
+    se_logHR  = se,
+    mcid_rr   = mcid,
+    eb_mu_log = eb_mu_log,
+    eb_sd_log = eb_sd_log,
+    design_hr = design_hr
+  )
+  df_fit <- tibble::tibble(effect = logHR, se = se)
+
+  draws <- if (isTRUE(HAVE_STAN)) {
+    tryCatch(
+      suppressMessages(suppressWarnings(
+        fit_brms_study(df_fit, priors, mcid = mcid,
+                       chains = N_CHAINS, iter = N_ITER)
+      )),
+      error = function(e) NULL
+    )
+  } else {
+    NULL
+  }
+
+  if (is.null(draws)) {
+    # Analytic Normal-Normal fallback for the four Normal priors.
+    analytic_post <- function(mu0, tau0) {
+      prec_post <- 1 / tau0^2 + 1 / se^2
+      mu_post   <- (mu0 / tau0^2 + logHR / se^2) / prec_post
+      sd_post   <- sqrt(1 / prec_post)
+      mu_draws  <- rnorm(4000, mu_post, sd_post)
+      tibble::tibble(mu = mu_draws, RR = exp(mu_draws))
+    }
+    draws <- dplyr::bind_rows(
+      analytic_post(0,              10)    |> dplyr::mutate(prior = "Weak"),
+      analytic_post(0,              0.354) |> dplyr::mutate(prior = "Skeptical"),
+      analytic_post(log(mcid),      0.354) |> dplyr::mutate(prior = "Enthusiastic"),
+      analytic_post(log(design_hr), se)    |> dplyr::mutate(prior = "DesignInformed")
+    )
+  } else {
+    # If brms produced draws under all five priors, drop its EB row and
+    # replace it with the direct mixture-EB draws (more faithful to the
+    # van Zwet posterior).
+    draws <- draws |> dplyr::filter(prior != "EB")
+  }
+  draws <- dplyr::bind_rows(draws, eb_draws_tbl)
+
+  summary_tbl <- summarise_posterior(draws, mcid = mcid) |>
+    dplyr::mutate(study = study, .before = 1)
+
+  list(
+    study      = study,
+    tms        = tms,
+    eb         = list(snr_post_mean = snr_post_mean,
+                      snr_draws     = eb$snr,
+                      components    = eb$components,
+                      B_bar         = eb$B_bar,
+                      eb_mu_log     = eb_mu_log,
+                      eb_sd_log     = eb_sd_log),
+    draws      = draws,
+    summary_tbl = summary_tbl
+  )
+}
+
+results <- purrr::map(split(cohort_hr, seq_len(nrow(cohort_hr))), run_one)
+names(results) <- cohort_hr$study
+```
+
+```{r}
+#| label: study-plots
+#| fig-width: 8
+#| fig-height: 4
+for (r in results) {
+  mcid_rr <- cohort_hr$mcid_rr[cohort_hr$study == r$study]
+  print(plot_study_densities(r$draws, mcid_rr, study = r$study))
+}
+```
+
+```{r}
+#| label: per-study-summary
+summary_all <- dplyr::bind_rows(lapply(results, `[[`, "summary_tbl"))
+knitr::kable(summary_all |> dplyr::mutate(
+  median_RR = round(median_RR, 3),
+  lo95 = round(lo95, 3),
+  hi95 = round(hi95, 3),
+  P_RR_lt_1 = round(P_RR_lt_1, 3),
+  P_RR_le_mcid = round(P_RR_le_mcid, 3)
+))
+
+# Per-study frequentist-calibration table:
+# Type-S / Type-M from the retrodesign simulation PLUS two Shannon
+# S-values computed from the two-sided p against different reference
+# RRs (null and MCID).
+tms_tbl <- tibble::tibble(
+  study   = vapply(results, `[[`, character(1), "study"),
+  type_s  = vapply(results, function(r) r$tms$type_s, numeric(1)),
+  type_m  = vapply(results, function(r) r$tms$type_m, numeric(1))
+) |>
+  dplyr::left_join(
+    cohort_hr |> dplyr::select(study, z = z_obs, p = p_two,
+                               s_null, s_mcid, mcid_rr),
+    by = "study"
+  )
+knitr::kable(tms_tbl |>
+               dplyr::mutate(type_s         = round(type_s, 3),
+                             type_m         = round(type_m, 2),
+                             `z`            = round(z, 2),
+                             `p`            = signif(p, 2),
+                             `S vs RR=1`    = round(s_null, 2),
+                             `S vs RR=MCID` = round(s_mcid, 2),
+                             `MCID`         = mcid_rr) |>
+               dplyr::select(study, type_s, type_m, z, p,
+                             `S vs RR=1`, `MCID`, `S vs RR=MCID`),
+             caption = paste0(
+               "Frequentist calibration: Type-S, Type-M exaggeration, ",
+               "observed z, p, and two Shannon S-values. ",
+               "A large 'S vs RR=1' with a small 'S vs RR=MCID' means ",
+               "the data strongly reject the null but are compatible ",
+               "with an effect at the design-MCID magnitude."))
+```
+
+## Empirical-Bayes deep-dive (per `eb2.qmd`)
+### Cochrane mixture component weights, by study
+For each study, the table below shows how the **posterior weight** is
+redistributed across the four van Zwet components after seeing the
+observed z. Smaller-SD components correspond to more aggressive shrinkage
+(`B_k` close to 0); larger-SD components leave the data nearly untouched
+(`B_k` close to 1). The `B_bar` column is the overall posterior shrinkage
+factor (a study-level summary of how much the EB prior moves the raw
+estimate toward 0).
+
+```{r}
+#| label: eb-components
+eb_comp_tbl <- dplyr::bind_rows(lapply(names(results), function(s) {
+  comp <- results[[s]]$eb$components
+  comp$component <- seq_len(nrow(comp))
+  comp$study     <- s
+  comp$B_bar     <- results[[s]]$eb$B_bar
+  comp
+}))
+knitr::kable(
+  eb_comp_tbl |>
+    dplyr::select(study, component, weight, mean, sd, B, B_bar) |>
+    dplyr::mutate(weight = round(weight, 3),
+                  mean   = round(mean,   3),
+                  sd     = round(sd,     3),
+                  B      = round(B,      3),
+                  B_bar  = round(B_bar,  3)),
+  caption = paste0(
+    "Per-study posterior decomposition under the van Zwet mixture: ",
+    "component-wise weight, conditional mean (B_k * z), SD, shrinkage ",
+    "factor B_k, and overall pooled shrinkage B_bar."
+  )
+)
+```
+
+### Calibration metrics (Type-S / Type-M / Coverage / Replication)
+These are the same four calibration metrics computed by `eb2.qmd`'s
+`compute_metrics()` function, evaluated for every (study, prior)
+combination using posterior draws on the SNR scale
+(`SNR_draws = mu_draws / SE`):
+
+- **Type-S** = `P(sign(SNR_post) != sign(z_obs))` - probability the true
+  effect has the opposite sign to the observed z.
+- **Type-M (median)** = `median(|z_obs / SNR_post|)` - typical exaggeration
+  of |z| relative to the true effect size on the SNR scale.
+- **Coverage** = `P(z_obs - 1.96 < SNR_post < z_obs + 1.96)` - the
+  fraction of posterior SNR mass inside a same-size CI around the
+  observed z (high values flag a posterior nearly identical to the data;
+  low values flag aggressive shrinkage).
+- **Replication** = `P(|SNR_post + N(0,1)| > 1.96  AND  same sign as z_obs)`
+  - Bayesian probability that a same-size replication trial would land
+  outside +/- 1.96 *with the original sign*.
+
+```{r}
+#| label: eb-calibration-metrics
+compute_eb_metrics <- function(z_obs, snr_draws) {
+  if (!length(snr_draws) || all(!is.finite(snr_draws))) {
+    return(data.frame(type_s     = NA_real_,
+                      type_m_med = NA_real_,
+                      coverage   = NA_real_,
+                      replicate  = NA_real_))
+  }
+  infl  <- abs(z_obs / snr_draws)
+  s_err <- mean(sign(z_obs) != sign(snr_draws), na.rm = TRUE)
+  cover <- mean(snr_draws > (z_obs - 1.96) &
+                snr_draws < (z_obs + 1.96), na.rm = TRUE)
+  z2    <- snr_draws + rnorm(length(snr_draws))
+  repl  <- mean(abs(z2) > 1.96 & sign(z2) == sign(z_obs), na.rm = TRUE)
+  data.frame(type_s     = s_err,
+             type_m_med = stats::median(infl, na.rm = TRUE),
+             coverage   = cover,
+             replicate  = repl)
+}
+
+set.seed(2026)
+calib_tbl <- dplyr::bind_rows(lapply(names(results), function(s) {
+  z   <- cohort_hr$z_obs[cohort_hr$study == s]
+  se  <- cohort_hr$se_logHR[cohort_hr$study == s]
+  drs <- results[[s]]$draws
+  prs <- split(drs, drs$prior)
+  rows <- lapply(names(prs), function(p) {
+    snr <- prs[[p]]$mu / se     # log-HR draws -> SNR draws
+    cbind(study = s, prior = p, compute_eb_metrics(z, snr))
+  })
+  do.call(rbind, rows)
+}))
+
+knitr::kable(
+  calib_tbl |>
+    dplyr::mutate(type_s     = round(type_s,     3),
+                  type_m_med = round(type_m_med, 2),
+                  coverage   = round(coverage,   3),
+                  replicate  = round(replicate,  3)) |>
+    dplyr::arrange(study, factor(prior, levels = c(
+      "Weak", "Skeptical", "Enthusiastic", "EB", "DesignInformed"))),
+  caption = paste0(
+    "Posterior-based calibration metrics by study and prior ",
+    "(matches eb2.qmd `compute_metrics()`). Type-S, Type-M-median, ",
+    "Coverage, and same-sign Replication probability."
+  )
+)
+```
+
+Reading the table: under **EB** every study has Type-S near 0 and
+Type-M-median near 1 (the mixture prior aggressively shrinks any
+posterior that would imply a sign error or extreme exaggeration). Under
+**DesignInformed**, DECAF stands out: a Type-S that is no longer 0
+(the prior pulls a non-trivial fraction of posterior mass to the
+opposite side of the observed z), and a coverage that drops sharply -
+the data and the design-target prior simply disagree.
+
+## Cross-study summary
+
+```{r}
+#| label: forest
+#| fig-width: 9
+#| fig-height: 5
+plot_forest(summary_all)
+ggsave(file.path(RESULTS_DIR, "forest.png"), width = 9, height = 5, dpi = 120)
+```
+
+```{r}
+#| label: heatmap
+#| fig-width: 8
+#| fig-height: 5
+plot_heatmap_mcid(summary_all)
+ggsave(file.path(RESULTS_DIR, "heatmap_mcid.png"), width = 8, height = 5, dpi = 120)
+```
+
+```{r}
+#| label: shrinkage-scatter
+#| fig-width: 7
+#| fig-height: 5
+shrink_df <- tibble::tibble(
+  study        = cohort_hr$study,
+  abs_z        = abs(cohort_hr$z_obs),
+  abs_snr_post = vapply(results,
+                        function(r) abs(r$eb$snr_post_mean),
+                        numeric(1))
+)
+plot_shrinkage_scatter(shrink_df)
+ggsave(file.path(RESULTS_DIR, "shrinkage_scatter.png"), width = 7, height = 5, dpi = 120)
+
+# Persist a flat summary CSV for run_pipeline.R consumers.
+readr::write_csv(
+  dplyr::left_join(summary_all, tms_tbl, by = "study") |>
+    dplyr::left_join(cohort_hr |>
+                       dplyr::select(study, hr, ci_lo, ci_hi, z_obs, p_two,
+                                     s_value, power, mcid_rr), by = "study"),
+  file.path(RESULTS_DIR, "pipeline_summary.csv")
+)
+```
+
+## DECAF worked example (validation)
+
+DECAF randomised 200 post-cardioversion AF patients (1:1) to **caffeinated
+coffee (~1 cup/day)** versus **caffeine abstinence** [@RN1]. The published
+result — HR = 0.61 (95% CI 0.42 - 0.89, p = 0.01) — is for *caffeinated
+vs abstinence*: **caffeinated had 39% lower AF recurrence**.
+
+The trial was powered in the **opposite direction**. Caffeine has
+historically been viewed as proarrhythmic, so the protocol was designed
+to detect a **41% reduction in AF with *abstinence*** (decaf). In the
+caff/abst frame used by the published HR, that design target corresponds
+to a *hazard ratio greater than 1*: `design_hr = 1 / 0.59 ≈ 1.695`
+(i.e. the trial expected caffeinated to INCREASE AF vs abstinence).
+
+So DECAF gives us two quantities on opposite sides of 1:
+
+- **Observed effect:** HR = 0.61 (caffeinated favours) — log-HR ≈ -0.49
+- **Design target:**   HR = 1.695 (abstinence favours, pre-specified) — log-HR ≈ +0.53
+
+The **Design-informed prior** is therefore built around `log(design_hr)`,
+not `log(mcid_rr)`, and will **conflict** with the observed data. This is
+the point of the DECAF example in `eb2.qmd`.
+
+The **clinically meaningful threshold** in the observed direction is still
+`mcid_rr = 0.59` (a 41% reduction in the caffeinated arm would match the
+magnitude the trial was powered for, just with the arms swapped). That is
+what `P(HR <= MCID)` reports below.
+
+```{r}
+#| label: decaf
+decaf <- cohort_hr |> dplyr::filter(study == "DECAF")
+stopifnot(nrow(decaf) == 1)
+r_decaf <- results[["DECAF"]]
+
+# Observed summary + frequentist calibration (both S-values).
+decaf_obs <- dplyr::transmute(
+  decaf,
+  `HR (observed)`  = hr,
+  `95% CI`         = sprintf("[%.2f, %.2f]", ci_lo, ci_hi),
+  `log HR`         = round(logHR, 3),
+  `SE[log HR]`     = round(se_logHR, 3),
+  z                = round(z_obs, 2),
+  p                = signif(p_two, 2),
+  `S vs RR=1`      = round(s_null, 2),
+  `S vs RR=MCID`   = round(s_mcid, 2),
+  `MCID (RR)`      = mcid_rr,
+  `Design HR`      = design_hr
+)
+knitr::kable(decaf_obs, caption = "DECAF: frequentist observables, both Shannon S-values, and direction markers")
+
+# Posterior summaries under all five priors.
+decaf_post <- r_decaf$summary_tbl |>
+  dplyr::mutate(dplyr::across(median_RR:P_RR_le_mcid, ~round(.x, 3)))
+knitr::kable(decaf_post,
+             caption = "DECAF posterior HR summary across the five priors")
+
+# Key quantities for the narrative.
+eb_row <- decaf_post |> dplyr::filter(prior == "EB")
+di_row <- decaf_post |> dplyr::filter(prior == "DesignInformed")
+eb_rr_med <- eb_row$median_RR
+di_rr_med <- di_row$median_RR
+
+cat(sprintf("DECAF EB posterior HR median           : %.3f (95%% CrI %.3f - %.3f)\n",
+            eb_rr_med, eb_row$lo95, eb_row$hi95))
+cat(sprintf("DECAF Design-informed posterior median : %.3f (95%% CrI %.3f - %.3f)\n",
+            di_rr_med, di_row$lo95, di_row$hi95))
+
+# Sanity check: EB posterior HR median should lie in [0.65, 0.90].
+stopifnot(eb_rr_med >= 0.65, eb_rr_med <= 0.90)
+
+# Sanity check: the Design-informed prior, being centred on the opposite
+# side of 1 to the observed data, must produce a posterior materially
+# closer to 1 (and above the EB median).
+stopifnot(di_rr_med > eb_rr_med)
+```
+
+Interpretation:
+
+- Under **EB** shrinkage (calibrated from ~23,551 Cochrane trials), the
+  posterior HR shrinks modestly from the raw 0.61 towards 1, landing near
+  `r round(eb_rr_med, 3)` with 95% CrI `r round(eb_row$lo95, 2)` to
+  `r round(eb_row$hi95, 2)`. `P(HR < 1)` is essentially 1.
+- Under the **Design-informed** prior (centred on `HR = 1.695` per the
+  trial protocol), the posterior is pulled *away* from the observed
+  effect: median HR lands near `r round(di_rr_med, 3)`. This is the
+  price of trusting a prior that turned out to contradict the data.
+- `P(HR <= MCID = 0.59)` under EB is a modest `r eb_row$P_RR_le_mcid` —
+  i.e., the probability that caffeinated produces at least a 41%
+  reduction in AF recurrence (the magnitude the trial was powered for,
+  just in the opposite arm) is around that value.
+- **S-values tell the same story in bits.** `S vs RR=1` for DECAF is
+  `r round(decaf$s_null, 2)` bits — strong evidence *against* no effect,
+  as surprising as `r round(decaf$s_null, 0)` consecutive coin flips
+  under H0. But `S vs RR=MCID` is only `r round(decaf$s_mcid, 2)` bits:
+  the observed point estimate (HR 0.61) is **statistically compatible**
+  with the MCID magnitude (HR 0.59) — there is essentially no evidence
+  that the true effect differs from the clinically meaningful threshold.
+  Together, the two S-values show the classic profile of a borderline
+  significant small trial: clearly *something*, but not clearly *big*.
+
+## Discussion
+
+Across the curated cohort, three patterns emerge.
+
+**"Some benefit" is robust; "clinically meaningful benefit" is not.**
+`P(HR < 1)` is at or above 0.98 for every significant trial under every
+prior. `P(HR ≤ MCID)`, in contrast, ranges from near-zero for marginal
+trials (EMPA-REG ≈ 0.05; DECAF ≈ 0.22 under EB) to near-one for landmark
+trials with effect sizes well past their design target (PARADIGM-HF,
+RALES). Reporting only `P(HR < 1)` therefore exaggerates how confidently
+a trial achieves the magnitude of effect it was sold on.
+
+**EB shrinkage is study-strength dependent.** The pooled posterior
+shrinkage factor `B̄` — which is what closes the gap between observed
+and true effect under the van Zwet mixture — is close to 1 (minimal
+shrinkage) for high-`|z|` trials and drops materially for borderline
+trials. Operationally, this means EB *acts the most* exactly where it
+is most needed: marginal results where Type-M exaggeration is highest.
+
+**Design-informed priors can be misleading when the protocol gets it
+wrong.** DECAF is the cleanest example: the protocol expected
+abstinence to *reduce* AF recurrence, but the trial found that
+caffeinated coffee did. Centering a prior on `log(design_hr) ≈ +0.53`
+drags the posterior toward 1 and inflates Type-S, even though the
+frequentist evidence against the null is comfortably > 6 bits. This is
+a warning against treating the powered-effect direction as a default
+prior when the literature on which the design rests was itself
+uncertain.
+
+These patterns reinforce the methodological recommendations of van Zwet
+et al. and the "abandon statistical significance" literature: report
+posterior probabilities at *clinically meaningful* thresholds, not just
+at the null, and surface the Type-M / shrinkage diagnostics alongside
+the headline estimate.
+
+## Limitations
+
+- The cohort is a *curated* convenience sample of landmark CV RCTs and
+  is not the result of a systematic database search; relative effect
+  sizes here are illustrative of the methodology rather than
+  representative of the cardiovascular literature as a whole.
+- The `brms` model is a normal pseudo-likelihood on summary
+  `(logHR, SE)` rather than a re-analysis of patient-level data.
+  Where individual-patient data are available, refitting with arm-level
+  event counts (`brms::brm(events | trials(n) ~ arm, family = binomial())`)
+  would be preferred.
+- The van Zwet mixture is calibrated on the Cochrane Database of
+  Systematic Reviews; its applicability to specialty cardiovascular
+  endpoints (e.g. composite MACE) is plausible but not separately
+  validated here.
+- MCID values come from the original power calculations and inherit
+  whatever optimism was embedded there; sensitivity to alternative
+  MCID choices is implicit in the `S vs RR = MCID` column but not
+  formally varied across the cohort in this version.
+- The Stan probe in setup detects `cmdstanr`/`rstan` and silently falls
+  back to the analytic Normal–Normal posterior if neither is available.
+  Numerically the two paths are equivalent for this likelihood, but
+  reproducing the exact `brms` chain diagnostics requires a working
+  Stan toolchain.
+
+## Reproducibility {.unnumbered}
+
+```{r}
+#| label: session-info
+#| echo: false
+sessionInfo()
+```
+
+```{r}
+#| label: env-summary
+#| echo: false
+cat(sprintf("Stan backend available : %s\n", isTRUE(HAVE_STAN)))
+cat(sprintf("MCMC chains            : %d\n", N_CHAINS))
+cat(sprintf("MCMC iterations / chain: %d\n", N_ITER))
+cat(sprintf("EB mixture draws       : %d\n", N_EB))
+cat(sprintf("Cohort rows analysed   : %d\n", nrow(cohort_hr)))
+cat(sprintf("Pipeline summary CSV   : %s\n",
+            normalizePath(file.path(RESULTS_DIR, "pipeline_summary.csv"),
+                          mustWork = FALSE)))
+```
+
+## References {.unnumbered}

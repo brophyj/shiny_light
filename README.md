@@ -83,15 +83,27 @@ cmdstanr::install_cmdstan(cores = 2)   # one-time, ~5-15 min
 
 ## Running the Shiny apps
 
+###  On your local machine 
+
+From GitHub repo,  `https://github.com/brophyj/shiny_light.git` . download the zipped file 
+
+
 ```sh
 # Full-feature version (recommended):
+
 Rscript -e 'shiny::runApp("app_full.r", launch.browser = TRUE)'
 
 # Bayesian-only (no calibration metrics):
+
 Rscript -e 'shiny::runApp("app_bayes_alone.r", launch.browser = TRUE)'
 ```
 
 > Full parameter reference (plain-text, no rendered math): [`docs/shiny-app.md`](docs/shiny-app.md). Covers every sidebar input, the EB prior, an in-depth treatment of the `SE_new (log RR)` predictive parameter, every output tab, and common troubleshooting.
+
+### On the web 
+
+Use the link `https://jb-apps.shinyapps.io/Bayes_for_RCTs/`
+
 
 ### App layout
 
